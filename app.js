@@ -5,6 +5,9 @@ const MIN_STEP_M = 3;        // これより小さい移動はGPSのブレとし
 const MAX_SPEED_MPS = 12;    // これより速い移動は異常値として無視
 const CUR_PACE_WINDOW_MS = 30000; // 現在ペースは直近30秒で計算
 const SIM_SPEED_MPS = 1000 / 300; // シミュレーションは 5:00/km で走る
+const KALMAN_Q = 1;          // 平滑化の強さ（小さいほど強くなめらか、大きいほど急な動きに素早く反応）
+const KALMAN_RESET_MS = 60000; // これ以上GPSが途切れたら平滑化をリセット
+const CURVE_STEP_M = 2;      // 曲線を描くときの分割間隔（m）
 
 // ===== 地図 =====
 const map = L.map('map', { zoomControl: false }).setView(DEFAULT_CENTER, 16);
@@ -37,7 +40,11 @@ let simNow = Date.now();
 const clock = () => (sim.enabled ? simNow : Date.now());
 
 // ===== 位置情報の入口 =====
-function onPosition({ lat, lng, accuracy, t }) {
+const kalman = createKalman(KALMAN_Q);
+
+function onPosition({ lat: rawLat, lng: rawLng, accuracy, t }) {
+  // GPSのブレを平滑化した位置を、以降すべて（マーカー・軌跡・距離）で使う
+  const { lat, lng } = kalman.update(rawLat, rawLng, accuracy, t);
   lastPos = { lat, lng };
   const latlng = [lat, lng];
   meMarker.setLatLng(latlng);
@@ -68,7 +75,7 @@ function recordPoint(lat, lng, accuracy, t) {
   const last = seg[seg.length - 1];
   if (!last) {
     seg.push({ lat, lng, t });
-    polylines[polylines.length - 1].addLatLng([lat, lng]);
+    redrawCurrentLine();
     return;
   }
 
@@ -78,9 +85,106 @@ function recordPoint(lat, lng, accuracy, t) {
   if (dt > 0 && d / dt > MAX_SPEED_MPS) return;
 
   seg.push({ lat, lng, t });
-  polylines[polylines.length - 1].addLatLng([lat, lng]);
+  redrawCurrentLine();
   distanceM += d;
   recent.push({ t, d });
+}
+
+// 今走っている区間の線を、記録した点を通る曲線で描き直す
+function redrawCurrentLine() {
+  const seg = segments[segments.length - 1];
+  polylines[polylines.length - 1].setLatLngs(smoothPath(seg));
+}
+
+// ===== 軌跡の平滑化 =====
+// カルマンフィルタ（等速モデル）：位置と速度を同時に推定してGPSのブレを抑える
+// ・GPSの精度(accuracy)が悪い点ほど弱く反映する
+// ・速度も推定するので、走っている人に対して位置が遅れにくい
+// 計算は「スタート地点からの東西・南北のメートル」で行い、最後に緯度経度へ戻す
+function createKalman(q) {
+  let origin = null;
+  let lastT;
+  let ax, ay; // 東西(x)・南北(y)それぞれの { x: 位置, v: 速度, P: 誤差の大きさ(2x2) }
+
+  const toRad = (x) => (x * Math.PI) / 180;
+  const R = 6371000;
+
+  function axisUpdate(s, z, r, dt) {
+    // 予測：速度ぶん進める
+    s.x += s.v * dt;
+    const [[a, b], [c, d]] = s.P;
+    const P00 = a + dt * (b + c) + dt * dt * d + (q * dt ** 3) / 3;
+    const P01 = b + dt * d + (q * dt * dt) / 2;
+    const P10 = c + dt * d + (q * dt * dt) / 2;
+    const P11 = d + q * dt;
+    // 補正：GPSの値に寄せる（寄せる強さ k はGPSの精度で決まる）
+    const k0 = P00 / (P00 + r);
+    const k1 = P10 / (P00 + r);
+    const y = z - s.x;
+    s.x += k0 * y;
+    s.v += k1 * y;
+    s.P = [[(1 - k0) * P00, (1 - k0) * P01], [P10 - k1 * P00, P11 - k1 * P01]];
+  }
+
+  return {
+    update(lat, lng, accuracy, t) {
+      const r = Math.max(accuracy, 1) ** 2;
+      if (!origin || t - lastT > KALMAN_RESET_MS) {
+        origin = { lat, lng };
+        lastT = t;
+        ax = { x: 0, v: 0, P: [[r, 0], [0, 25]] };
+        ay = { x: 0, v: 0, P: [[r, 0], [0, 25]] };
+        return { lat, lng };
+      }
+      const cos = Math.cos(toRad(origin.lat));
+      const dt = (t - lastT) / 1000;
+      lastT = t;
+      if (dt > 0) {
+        axisUpdate(ax, toRad(lng - origin.lng) * R * cos, r, dt);
+        axisUpdate(ay, toRad(lat - origin.lat) * R, r, dt);
+      }
+      return {
+        lat: origin.lat + ((ay.x / R) * 180) / Math.PI,
+        lng: origin.lng + ((ax.x / (R * cos)) * 180) / Math.PI,
+      };
+    },
+  };
+}
+
+// Catmull-Rom スプライン（centripetal）：すべての点を通るなめらかな曲線の座標列を返す
+// centripetal 方式は急カーブでも線がループしたり膨らみすぎたりしにくい
+function smoothPath(pts) {
+  if (pts.length < 3) return pts.map((p) => [p.lat, p.lng]);
+  // 両端は「反対側に折り返した仮の点」を補って曲線を作る
+  const mirror = (a, b) => ({ lat: 2 * a.lat - b.lat, lng: 2 * a.lng - b.lng });
+  const ext = [mirror(pts[0], pts[1]), ...pts, mirror(pts[pts.length - 1], pts[pts.length - 2])];
+
+  const out = [[pts[0].lat, pts[0].lng]];
+  for (let i = 1; i < ext.length - 2; i++) {
+    const [p0, p1, p2, p3] = [ext[i - 1], ext[i], ext[i + 1], ext[i + 2]];
+    const n = Math.min(10, Math.max(1, Math.ceil(haversine(p1, p2) / CURVE_STEP_M)));
+    for (let j = 1; j <= n; j++) out.push(catmullRom(p0, p1, p2, p3, j / n));
+  }
+  return out;
+}
+
+function catmullRom(p0, p1, p2, p3, u) {
+  const knot = (a, b) => Math.max(Math.sqrt(haversine(a, b)), 1e-6);
+  const t1 = knot(p0, p1);
+  const t2 = t1 + knot(p1, p2);
+  const t3 = t2 + knot(p2, p3);
+  const t = t1 + (t2 - t1) * u;
+  const lerp = (a, b, ta, tb) => {
+    const w = (t - ta) / (tb - ta);
+    return { lat: a.lat + (b.lat - a.lat) * w, lng: a.lng + (b.lng - a.lng) * w };
+  };
+  const a1 = lerp(p0, p1, 0, t1);
+  const a2 = lerp(p1, p2, t1, t2);
+  const a3 = lerp(p2, p3, t2, t3);
+  const b1 = lerp(a1, a2, 0, t2);
+  const b2 = lerp(a2, a3, t1, t3);
+  const c = lerp(b1, b2, t1, t2);
+  return [c.lat, c.lng];
 }
 
 // ===== 実機GPS =====
@@ -202,7 +306,9 @@ function beginSegment() {
   // スタート地点＝今いる場所から線を引き始める
   const first = lastPos ? [{ ...lastPos, t: clock() }] : [];
   segments.push(first);
-  polylines.push(L.polyline(first.map((p) => [p.lat, p.lng]), { color: '#3ee08f', weight: 6, opacity: 0.9 }).addTo(map));
+  polylines.push(L.polyline(first.map((p) => [p.lat, p.lng]), {
+    color: '#3ee08f', weight: 6, opacity: 0.9, lineCap: 'round', lineJoin: 'round',
+  }).addTo(map));
 }
 
 function resetRun() {
