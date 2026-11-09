@@ -5,6 +5,7 @@
   --muted: #8ea0bf;
   --accent: #3ee08f;
   --danger: #ff5c6c;
+  --course: #5aa9ff;  /* 予定コースの色 */
 }
 
 * { box-sizing: border-box; }
@@ -65,10 +66,11 @@ html, body {
   font-variant-numeric: tabular-nums;
 }
 
+/* 状態表示と現在地ボタンは、下の操作パネルのすぐ上に置く（パネルの高さが変わっても重ならない） */
 #status {
-  position: fixed;
+  position: absolute;
   left: 50%;
-  bottom: calc(env(safe-area-inset-bottom) + 150px);
+  bottom: calc(100% + 12px);
   transform: translateX(-50%);
   z-index: 1000;
   max-width: calc(100% - 32px);
@@ -82,9 +84,9 @@ html, body {
 #status:empty { display: none; }
 
 .icon-btn {
-  position: fixed;
+  position: absolute;
   right: 16px;
-  bottom: calc(env(safe-area-inset-bottom) + 190px);
+  bottom: calc(100% + 52px);
   z-index: 1000;
   width: 48px; height: 48px;
   border: none;
@@ -112,13 +114,6 @@ html, body {
   color: var(--muted);
   margin-bottom: 10px;
 }
-.sim select {
-  background: transparent;
-  color: var(--text);
-  border: 1px solid var(--muted);
-  border-radius: 6px;
-}
-
 .buttons { display: flex; gap: 10px; }
 .buttons button {
   flex: 1;
@@ -133,6 +128,91 @@ html, body {
 .buttons button.primary { background: var(--accent); color: #062014; }
 .buttons button.danger  { background: var(--danger); color: #fff; }
 .buttons button[hidden] { display: none; }
+
+/* コース情報（計測値の下） */
+.course-info {
+  margin-top: 8px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--course);
+  font-variant-numeric: tabular-nums;
+}
+.course-info[hidden] { display: none; }
+
+/* コースづくりパネル */
+.planner {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap; /* 狭い画面では「コースを作る」ボタンを2段目に */
+  gap: 8px;
+  margin-bottom: 10px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.planner[hidden] { display: none; }
+.seg { display: flex; border: 1px solid #33456a; border-radius: 10px; overflow: hidden; flex: none; }
+.seg button {
+  border: none;
+  padding: 8px 10px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+.seg button.on { background: var(--course); color: #06142b; }
+.plan-value { display: flex; align-items: center; gap: 4px; flex: none; }
+.plan-value input {
+  width: 56px;
+  padding: 6px;
+  border: 1px solid #33456a;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 16px; /* 16px未満だと iPhone で入力時に画面が拡大される */
+  text-align: right;
+}
+.plan-pace { display: flex; align-items: center; gap: 4px; flex: none; }
+.plan-pace select,
+.sim select {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--muted);
+  border-radius: 6px;
+}
+.plan-btn {
+  flex: 1 1 calc(100% - 44px);
+  min-width: 0;
+  height: 36px;
+  border: none;
+  border-radius: 10px;
+  background: var(--course);
+  color: #06142b;
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.plan-btn:disabled { opacity: .5; }
+.plan-clear {
+  flex: none;
+  width: 36px; height: 36px;
+  border: none;
+  border-radius: 10px;
+  background: #24324d;
+  color: var(--text);
+  font-size: 16px;
+}
+.plan-clear[hidden] { display: none; }
+
+/* コースのスタート地点 */
+.start-flag {
+  width: 22px; height: 22px;
+  border-radius: 50%;
+  background: #fff;
+  border: 3px solid var(--course);
+  color: #06142b;
+  font: 800 11px/16px sans-serif;
+  text-align: center;
+}
 
 /* 現在地マーカー */
 .me-dot {

@@ -21,14 +21,32 @@
       <div class="stat"><label>平均ペース</label><span id="avgPace">--'--"</span></div>
       <div class="stat"><label>現在ペース</label><span id="curPace">--'--"</span></div>
     </div>
+    <div id="courseInfo" class="course-info" hidden></div>
   </header>
-
-  <div id="status">位置情報を待っています…</div>
-
-  <button id="recenterBtn" class="icon-btn" title="現在地に戻る">◎</button>
 
   <!-- 下部：操作 -->
   <footer class="controls">
+    <div id="status">位置情報を待っています…</div>
+    <button id="recenterBtn" class="icon-btn" title="現在地に戻る">◎</button>
+
+    <!-- コースづくり：距離か時間を入れると、今いる場所から戻ってくる周回コースを作る -->
+    <div id="planner" class="planner">
+      <div class="seg" role="group" aria-label="コースの決め方">
+        <button type="button" data-mode="distance" class="on">距離</button>
+        <button type="button" data-mode="time">時間</button>
+      </div>
+      <label class="plan-value">
+        <input id="planValue" type="number" inputmode="decimal" min="0.5" max="42" step="0.5" value="3">
+        <span id="planUnit">km</span>
+      </label>
+      <label class="plan-pace">
+        目標
+        <select id="planPace"></select>
+      </label>
+      <button type="button" id="planBtn" class="plan-btn">コースを作る</button>
+      <button type="button" id="clearPlanBtn" class="plan-clear" title="コースを消す" hidden>×</button>
+    </div>
+
     <label class="sim">
       <input type="checkbox" id="simToggle">
       シミュレーション

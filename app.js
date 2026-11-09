@@ -8,6 +8,15 @@ const SIM_SPEED_MPS = 1000 / 300; // シミュレーションは 5:00/km で走�
 const KALMAN_Q = 1;          // 平滑化の強さ（小さいほど強くなめらか、大きいほど急な動きに素早く反応）
 const KALMAN_RESET_MS = 60000; // これ以上GPSが途切れたら平滑化をリセット
 const CURVE_STEP_M = 2;      // 曲線を描くときの分割間隔（m）
+// コースの自動生成
+const ROUTER_URL = 'https://routing.openstreetmap.de/routed-foot/route/v1/foot/'; // 徒歩用の経路検索（OSRM・APIキー不要）
+const COURSE_ROAD_FACTOR = 1.25; // 道は直線より遠回りになる分の見込み（円周 × この値 ≒ 実際の距離）
+const COURSE_TOLERANCE = 0.05;   // 目標距離との差がこの割合以内なら完成
+const COURSE_TRIES = 4;          // 経路検索をやり直す最大回数
+const COURSE_SNAP_M = 40;        // コースからこれ以上離れていたら進み具合を更新しない
+const COURSE_LOOKAHEAD_M = 150;  // 進み具合を探す範囲（今の位置より先、m）
+const COURSE_DONE_M = 30;        // 残りがこれ以下になったら完走
+const DEFAULT_PACE_SEC = 360;    // 目標ペースの初期値（6:00/km）
 
 // ===== 地図 =====
 const map = L.map('map', { zoomControl: false }).setView(DEFAULT_CENTER, 16);
@@ -60,7 +69,8 @@ function onPosition({ lat: rawLat, lng: rawLng, accuracy, t }) {
 
   if (state === 'running') {
     recordPoint(lat, lng, accuracy, t);
-    setStatus('');
+    updateCourseProgress(lastPos);
+    if (!courseDone) setStatus('');
   } else if (state === 'idle') {
     setStatus(accuracy > MAX_ACCURACY_M
       ? `GPS精度が低いです（±${Math.round(accuracy)}m）`
@@ -223,12 +233,13 @@ function stopGps() {
 }
 
 // ===== シミュレーション（室内テスト用） =====
-const sim = { enabled: false, timer: null, heading: Math.random() * 360, pos: null };
+const sim = { enabled: false, timer: null, heading: Math.random() * 360, pos: null, courseD: 0 };
 
 function startSim() {
   sim.enabled = true;
   simNow = Date.now();
   sim.pos = lastPos ? { ...lastPos } : { lat: DEFAULT_CENTER[0], lng: DEFAULT_CENTER[1] };
+  if (course) { sim.courseD = 0; sim.pos = { ...course.points[0] }; }
   onPosition({ ...sim.pos, accuracy: 5, t: simNow });
   sim.timer = setInterval(simTick, 1000);
 }
@@ -236,10 +247,19 @@ function startSim() {
 function simTick() {
   const speed = Number(document.getElementById('simSpeed').value);
   simNow += 1000 * speed;
-  // 向きを少しずつ変えながら進む
-  sim.heading += (Math.random() - 0.5) * 30;
-  const step = SIM_SPEED_MPS * speed * (0.9 + Math.random() * 0.2);
-  sim.pos = movePoint(sim.pos, sim.heading, step);
+  if (course) {
+    // コースがあるときは、計測中だけ目標ペースでコースの上を走る
+    if (state === 'running') {
+      const step = (1000 / course.paceSec) * speed * (0.9 + Math.random() * 0.2);
+      sim.courseD = Math.min(course.lengthM, sim.courseD + step);
+    }
+    sim.pos = pointAlongCourse(sim.courseD);
+  } else {
+    // コースがないときは、向きを少しずつ変えながら進む
+    sim.heading += (Math.random() - 0.5) * 30;
+    const step = SIM_SPEED_MPS * speed * (0.9 + Math.random() * 0.2);
+    sim.pos = movePoint(sim.pos, sim.heading, step);
+  }
   onPosition({ ...sim.pos, accuracy: 5, t: simNow });
 }
 
@@ -247,6 +267,160 @@ function stopSim() {
   clearInterval(sim.timer);
   sim.enabled = false;
 }
+
+// ===== コースの自動生成 =====
+// 距離（または 時間×目標ペース）を入れると、今いる場所から出発して戻ってくる周回コースを作る。
+// しくみ：スタート地点を通る円を描き、円周上の3点を「経由地」にして、徒歩の経路検索で道に沿ったルートにする。
+//         できたルートの距離が目標とずれていたら、円の大きさを比で直して検索し直す。
+// course は後で「並走者（AIコーチ）」や「コインを置く場所」にも使う。
+let course = null; // { points: [{lat,lng}], cum: [スタートからの距離m], lengthM, targetM, paceSec }
+let courseLayer = null;
+let courseProgressM = 0; // コース上をスタートから何m進んだか
+let courseDone = false;
+let planMode = 'distance'; // distance | time
+
+async function generateCourse(targetM, paceSec) {
+  const start = lastPos || { lat: DEFAULT_CENTER[0], lng: DEFAULT_CENTER[1] };
+  const heading = Math.random() * 360; // 毎回ちがう向きに作る
+  let radius = targetM / (2 * Math.PI * COURSE_ROAD_FACTOR);
+  let best = null;
+
+  for (let i = 0; i < COURSE_TRIES; i++) {
+    const center = movePoint(start, heading, radius);
+    const back = heading + 180; // 円の中心から見たスタート地点の向き
+    const via = [90, 180, 270].map((a) => movePoint(center, back + a, radius));
+    const route = await fetchRoute([start, ...via, start]);
+    if (!best || Math.abs(route.lengthM - targetM) < Math.abs(best.lengthM - targetM)) best = route;
+    if (Math.abs(route.lengthM - targetM) / targetM <= COURSE_TOLERANCE) break;
+    radius *= targetM / route.lengthM; // 長すぎたら円を小さく、短すぎたら大きく
+  }
+  return { ...best, targetM, paceSec };
+}
+
+async function fetchRoute(points) {
+  const coords = points.map((p) => `${p.lng.toFixed(6)},${p.lat.toFixed(6)}`).join(';');
+  const res = await fetch(`${ROUTER_URL}${coords}?overview=full&geometries=geojson`);
+  if (!res.ok) throw new Error(`経路検索に失敗しました（${res.status}）`);
+  const data = await res.json();
+  if (data.code !== 'Ok' || !data.routes?.length) throw new Error('経路が見つかりませんでした');
+  const pts = data.routes[0].geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
+  const cum = [0];
+  for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + haversine(pts[i - 1], pts[i]));
+  return { points: pts, cum, lengthM: cum[cum.length - 1] };
+}
+
+function drawCourse() {
+  courseLayer?.remove();
+  courseLayer = null;
+  if (!course) return;
+  const line = course.points.map((p) => [p.lat, p.lng]);
+  courseLayer = L.layerGroup([
+    L.polyline(line, { color: '#5aa9ff', weight: 5, opacity: 0.85, dashArray: '2 10', lineCap: 'round' }),
+    L.marker(line[0], {
+      icon: L.divIcon({ className: '', html: '<div class="start-flag">S</div>', iconSize: [22, 22] }),
+    }),
+  ]).addTo(map);
+  courseLayer.eachLayer((l) => l.bringToBack?.()); // 走った線より下に描く
+}
+
+// コース上の、スタートから d m の地点（シミュレーションと、後で並走者に使う）
+function pointAlongCourse(d) {
+  const { points, cum } = course;
+  if (d <= 0) return points[0];
+  if (d >= course.lengthM) return points[points.length - 1];
+  let i = 1;
+  while (cum[i] < d) i++;
+  const w = (d - cum[i - 1]) / (cum[i] - cum[i - 1] || 1);
+  const a = points[i - 1];
+  const b = points[i];
+  return { lat: a.lat + (b.lat - a.lat) * w, lng: a.lng + (b.lng - a.lng) * w };
+}
+
+// 今の位置がコースのどこにあたるかを、今いる所より少し先までの範囲で探す（周回コースで終点に飛ばないように）
+// コースの点と点の間（線分）に垂線を下ろして、いちばん近い所を「進んだ距離」にする
+function updateCourseProgress(pos) {
+  if (!course) return;
+  const { points, cum } = course;
+  let bestM = courseProgressM;
+  let bestD = Infinity;
+  let j = 0;
+  while (j < points.length - 2 && cum[j + 1] < courseProgressM) j++; // 今いる線分から探し始める
+  for (; j < points.length - 1 && cum[j] <= courseProgressM + COURSE_LOOKAHEAD_M; j++) {
+    const { dist, along } = projectOnSegment(pos, points[j], points[j + 1]);
+    const m = cum[j] + along;
+    if (dist < bestD && m >= courseProgressM) { bestD = dist; bestM = m; }
+  }
+  if (bestD <= COURSE_SNAP_M) courseProgressM = bestM;
+  if (!courseDone && course.lengthM - courseProgressM <= COURSE_DONE_M) {
+    courseDone = true;
+    setStatus('コース完走！ おつかれさま');
+  }
+}
+
+// 点 p から線分 a-b への距離と、a から垂線の足までの距離（m）。狭い範囲なので平面として計算する
+function projectOnSegment(p, a, b) {
+  const R = 6371000;
+  const cos = Math.cos((a.lat * Math.PI) / 180);
+  const toXY = (q) => ({ x: ((q.lng - a.lng) * Math.PI / 180) * R * cos, y: ((q.lat - a.lat) * Math.PI / 180) * R });
+  const B = toXY(b);
+  const P = toXY(p);
+  const len2 = B.x * B.x + B.y * B.y;
+  const u = len2 > 0 ? Math.min(1, Math.max(0, (P.x * B.x + P.y * B.y) / len2)) : 0;
+  return { dist: Math.hypot(P.x - u * B.x, P.y - u * B.y), along: u * Math.sqrt(len2) };
+}
+
+const planValue = document.getElementById('planValue');
+const planPace = document.getElementById('planPace');
+const planBtn = document.getElementById('planBtn');
+const clearPlanBtn = document.getElementById('clearPlanBtn');
+
+// 目標ペースの選択肢 4:00〜9:00/km（30秒ごと）
+for (let sec = 240; sec <= 540; sec += 30) {
+  planPace.add(new Option(`${formatPace(sec)}/km`, sec, false, sec === DEFAULT_PACE_SEC));
+}
+
+document.querySelectorAll('.seg button').forEach((b) => b.addEventListener('click', () => {
+  planMode = b.dataset.mode;
+  document.querySelectorAll('.seg button').forEach((x) => x.classList.toggle('on', x === b));
+  const isTime = planMode === 'time';
+  document.getElementById('planUnit').textContent = isTime ? '分' : 'km';
+  Object.assign(planValue, isTime ? { min: 5, max: 300, step: 5 } : { min: 0.5, max: 42, step: 0.5 });
+  planValue.value = isTime ? 30 : 3;
+}));
+
+planBtn.addEventListener('click', async () => {
+  const v = Number(planValue.value);
+  const paceSec = Number(planPace.value);
+  const targetM = planMode === 'time' ? (v * 60 / paceSec) * 1000 : v * 1000;
+  if (!(targetM >= 300 && targetM <= 42195)) {
+    setStatus('距離は 0.3〜42km（時間なら目標ペースで その範囲）にしてください');
+    return;
+  }
+  planBtn.disabled = true;
+  planBtn.textContent = '作成中…';
+  setStatus('コースを作っています…');
+  try {
+    course = await generateCourse(targetM, paceSec);
+    courseProgressM = 0;
+    courseDone = false;
+    drawCourse();
+    fitToVisibleArea(course.points.map((p) => [p.lat, p.lng]));
+    follow = false;
+    if (sim.enabled) { sim.courseD = 0; sim.pos = { ...course.points[0] }; }
+    setStatus('');
+  } catch (e) {
+    setStatus(`コースを作れませんでした：${e.message}`);
+  } finally {
+    planBtn.disabled = false;
+    render();
+  }
+});
+
+clearPlanBtn.addEventListener('click', () => {
+  course = null;
+  drawCourse();
+  render();
+});
 
 // ===== 操作 =====
 const startBtn = document.getElementById('startBtn');
@@ -281,7 +455,7 @@ finishBtn.addEventListener('click', () => {
   state = 'finished';
   releaseWakeLock();
   const all = polylines.flatMap((p) => p.getLatLngs());
-  if (all.length > 1) map.fitBounds(L.latLngBounds(all), { padding: [40, 40] });
+  if (all.length > 1) fitToVisibleArea(all);
   follow = false;
   setStatus(`おつかれさま！ ${(distanceM / 1000).toFixed(2)} km / ${formatDuration(movingMs)}`);
   render();
@@ -320,6 +494,9 @@ function resetRun() {
   recent = [];
   follow = true;
   state = 'idle';
+  courseProgressM = 0;
+  courseDone = false;
+  sim.courseD = 0;
 }
 
 // ===== 画面更新 =====
@@ -329,6 +506,10 @@ function render() {
   pauseBtn.hidden = state !== 'running';
   finishBtn.hidden = !(state === 'running' || state === 'paused');
   simToggle.disabled = state === 'running' || state === 'paused';
+  // コースづくりは走る前（と走り終わった後）だけ
+  document.getElementById('planner').hidden = state === 'running' || state === 'paused';
+  planBtn.textContent = course ? '別のコース' : 'コースを作る';
+  clearPlanBtn.hidden = !course;
   updateStats();
 }
 
@@ -346,9 +527,33 @@ function updateStats() {
   const span = recent.length > 1 ? (recent[recent.length - 1].t - recent[0].t) / 1000 : 0;
   document.getElementById('curPace').textContent =
     state === 'running' && d > 10 && span > 0 ? formatPace(span / (d / 1000)) : `--'--"`;
+
+  // コース情報：走る前は「距離と目安の時間」、走り出したら「残り」
+  const info = document.getElementById('courseInfo');
+  info.hidden = !course;
+  if (course) {
+    const km = (course.lengthM / 1000).toFixed(2);
+    if (state === 'idle') {
+      const etaMs = (course.lengthM / 1000) * course.paceSec * 1000;
+      info.textContent = `コース ${km} km ・ 目安 ${formatDuration(etaMs)}（${formatPace(course.paceSec)}/km）`;
+    } else {
+      const rest = Math.max(0, course.lengthM - courseProgressM) / 1000;
+      info.textContent = `コース ${km} km ・ 残り ${rest.toFixed(2)} km`;
+    }
+  }
 }
 
 setInterval(updateStats, 250);
+
+// 上の計測値と下の操作パネルに隠れない範囲に、線全体が収まるように地図を動かす
+function fitToVisibleArea(latlngs) {
+  const top = document.querySelector('.stats').offsetHeight;
+  const bottom = document.querySelector('.controls').offsetHeight;
+  map.fitBounds(L.latLngBounds(latlngs), {
+    paddingTopLeft: [24, top + 24],
+    paddingBottomRight: [24, bottom + 24],
+  });
+}
 
 function setStatus(text) {
   document.getElementById('status').textContent = text;
